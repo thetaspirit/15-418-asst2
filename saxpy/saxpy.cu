@@ -32,10 +32,10 @@ saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) 
     float* device_y;
     float* device_result;
 
-    //
-    // TODO allocate device memory buffers on the GPU using cudaMalloc
-    //
-
+    // allocate device memory buffers on the GPU using cudaMalloc
+    float* v_host = malloc(totalBytes);
+    float* v_device = nullptr;
+    cudaMalloc((void**)&v_device, totalBytes);
 
     // start timing after allocation of device memory
     double startTime = CycleTimer::currentSeconds();
@@ -46,8 +46,11 @@ saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) 
 
 
     // run kernel
+    double kernelStart = CycleTimer::currentSeconds();
     saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y, device_result);
     cudaDeviceSynchronize();
+    cudaThreadSynchronize();
+    double kernelEnd = CycleTimer::currentSeconds();
 
     //
     // TODO copy result from GPU using cudaMemcpy
@@ -62,7 +65,9 @@ saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) 
     }
 
     double overallDuration = endTime - startTime;
+    double kernelDuration = kernelEnd - kernelStart;
     printf("Overall: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * overallDuration, toBW(totalBytes, overallDuration));
+    printf("Kernel: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * kernelDuration, toBW(totalBytes, kernelDuration));
 
     // TODO free memory buffers on the GPU
 
