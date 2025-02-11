@@ -16,7 +16,7 @@ saxpy_kernel(int N, float alpha, float* x, float* y, float* result) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (index < N)
-       result[index] = alpha * x[index] + y[index];
+        result[index] = alpha * x[index] + y[index];
 }
 
 void
@@ -32,29 +32,25 @@ saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) 
     float* device_y;
     float* device_result;
 
-    // allocate device memory buffers on the GPU using cudaMalloc
-    float* v_host = malloc(totalBytes);
-    float* v_device = nullptr;
-    cudaMalloc((void**)&v_device, totalBytes);
+    cudaMalloc((void **) &device_x, sizeof(float)*N);
+    cudaMalloc((void **) &device_y, sizeof(float)*N);
+    cudaMalloc((void **) &device_result, sizeof(float)*N);
+
 
     // start timing after allocation of device memory
     double startTime = CycleTimer::currentSeconds();
-
-    //
-    // TODO copy input arrays to the GPU using cudaMemcpy
-    //
+    cudaMemcpy(device_x, xarray, sizeof(float)*N, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_y, yarray, sizeof(float)*N, cudaMemcpyHostToDevice);
 
 
     // run kernel
-    double kernelStart = CycleTimer::currentSeconds();
+    double kernelStartTime = CycleTimer::currentSeconds();
     saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y, device_result);
     cudaDeviceSynchronize();
     cudaThreadSynchronize();
-    double kernelEnd = CycleTimer::currentSeconds();
+    double kernelEndTime = CycleTimer::currentSeconds();
 
-    //
-    // TODO copy result from GPU using cudaMemcpy
-    //
+    cudaMemcpy(resultarray, device_result, sizeof(float)*N, cudaMemcpyDeviceToHost);
 
     // end timing after result has been copied back into host memory
     double endTime = CycleTimer::currentSeconds();
@@ -65,12 +61,13 @@ saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) 
     }
 
     double overallDuration = endTime - startTime;
-    double kernelDuration = kernelEnd - kernelStart;
     printf("Overall: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * overallDuration, toBW(totalBytes, overallDuration));
+    double kernelDuration = kernelEndTime - kernelStartTime;
     printf("Kernel: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * kernelDuration, toBW(totalBytes, kernelDuration));
 
-    // TODO free memory buffers on the GPU
-
+    cudaFree(device_x);
+    cudaFree(device_y);
+    cudaFree(device_result);
 }
 
 void
