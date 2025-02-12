@@ -29,6 +29,33 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void
+upsweep_kernel(int N, int *data, int twod, int twod1) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = tid * twod1;
+
+    if (i < N) {
+        data[i+twod1-1] += data[i+twod-1];
+    }
+}
+
+__global__ void
+downsweep_kernel(int N, int *data, int twod, int twod1) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = tid * twod1;
+
+    if (i < N) {
+        int t = data[i+twod-1];
+        data[i+twod-1] = data[i+twod1-1];
+        data[i+twod1-1] += t;
+    }
+}
+
+__global__ void
+array_set(int* data, int i, int val) {
+    data[i] = val;
+}
+
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -43,6 +70,29 @@ void exclusive_scan(int* device_data, int length)
      * both the data array is sized to accommodate the next
      * power of 2 larger than the input.
      */
+    int N = nextPow2(length);
+
+    for (int twod = 1; twod < N; twod*=2) {
+        int twod1 = twod*2;
+        int numThreads = N / twod1;
+        int threadsPerBlock = 512;
+        int numBlocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+        upsweep_kernel<<<numBlocks, threadsPerBlock>>>(N, device_data, twod, twod1);
+        // cudaDeviceSynchronize();
+    }
+
+    array_set<<<1, 1>>>(device_data, N-1, 0);
+
+    for (int twod = N/2; twod >= 1; twod /= 2) {
+        int twod1 = twod*2;
+        int numThreads = N / twod1;
+        int threadsPerBlock = 512;
+        int numBlocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+        downsweep_kernel<<<numBlocks, threadsPerBlock>>>(N, device_data, twod, twod1);
+        // cudaDeviceSynchronize();
+    }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
