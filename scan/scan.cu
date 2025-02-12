@@ -171,7 +171,7 @@ __global__ void
 writepeaks_kernel(int N, int *peaks_flags, int *output, int *num_peaks) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (0 < i && i < N) {
+    if (1 < i && i < N) {
         if (peaks_flags[i] > peaks_flags[i-1]) {
            int peak_number = peaks_flags[i];
            int peak_location = i - 1;
@@ -200,7 +200,7 @@ int find_peaks(int *device_input, int length, int *device_output) {
     if (length < 3)
         return 0;
 
-    int numThreads = length - 2;
+    int numThreads = length;
     int threadsPerBlock = 128;
     int numBlocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
 
