@@ -17,6 +17,11 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define CIRCLE_BLOCK_DIM_X 256
+#define CIRCLE_BLOCK_DIM_Y 1
+
+#define PIXEL_BLOCK_DIM_X 128
+#define PIXEL_BLOCK_DIM_Y 256
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
@@ -33,6 +38,7 @@ struct GlobalConstants {
     float* velocity;
     float* color;
     float* radius;
+    char* blockCircleOverlap;
 
     int imageWidth;
     int imageHeight;
@@ -112,7 +118,7 @@ __global__ void kernelClearImage(float r, float g, float b, float a) {
 }
 
 // kernelAdvanceFireWorks
-// 
+//
 // Update positions of fireworks
 __global__ void kernelAdvanceFireWorks() {
     const float dt = 1.f / 60.f;
@@ -127,7 +133,7 @@ __global__ void kernelAdvanceFireWorks() {
     if (index >= cuConstRendererParams.numberOfCircles)
         return;
 
-    if (0 <= index && index < NUM_FIREWORKS) { // firework center; no update 
+    if (0 <= index && index < NUM_FIREWORKS) { // firework center; no update
         return;
     }
 
@@ -154,9 +160,9 @@ __global__ void kernelAdvanceFireWorks() {
     float cxsx = sx - cx;
     float cysy = sy - cy;
 
-    // Compute distance from fire-work 
+    // Compute distance from fire-work
     float dist = sqrt(cxsx * cxsx + cysy * cysy);
-    if (dist > maxDist) { // restore to starting position 
+    if (dist > maxDist) { // restore to starting position
         // Random starting position on fire-work's rim
         float angle = (sfIdx * 2 * pi)/NUM_SPARKS;
         float sinA = sin(angle);
@@ -168,60 +174,60 @@ __global__ void kernelAdvanceFireWorks() {
         position[index3j+1] = position[index3i+1] + y;
         position[index3j+2] = 0.0f;
 
-        // Travel scaled unit length 
+        // Travel scaled unit length
         velocity[index3j] = cosA/5.0;
         velocity[index3j+1] = sinA/5.0;
         velocity[index3j+2] = 0.0f;
     }
 }
 
-// kernelAdvanceHypnosis   
+// kernelAdvanceHypnosis
 //
 // Update the radius/color of the circles
-__global__ void kernelAdvanceHypnosis() { 
+__global__ void kernelAdvanceHypnosis() {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= cuConstRendererParams.numberOfCircles) 
-        return; 
+    if (index >= cuConstRendererParams.numberOfCircles)
+        return;
 
-    float* radius = cuConstRendererParams.radius; 
+    float* radius = cuConstRendererParams.radius;
 
     float cutOff = 0.5f;
-    // Place circle back in center after reaching threshold radisus 
-    if (radius[index] > cutOff) { 
-        radius[index] = 0.02f; 
-    } else { 
-        radius[index] += 0.01f; 
-    }   
-}   
+    // Place circle back in center after reaching threshold radisus
+    if (radius[index] > cutOff) {
+        radius[index] = 0.02f;
+    } else {
+        radius[index] += 0.01f;
+    }
+}
 
 
 // kernelAdvanceBouncingBalls
-// 
+//
 // Update the position of the balls
-__global__ void kernelAdvanceBouncingBalls() { 
+__global__ void kernelAdvanceBouncingBalls() {
     const float dt = 1.f / 60.f;
     const float kGravity = -2.8f; // sorry Newton
     const float kDragCoeff = -0.8f;
     const float epsilon = 0.001f;
 
-    int index = blockIdx.x * blockDim.x + threadIdx.x; 
-   
-    if (index >= cuConstRendererParams.numberOfCircles) 
-        return; 
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    float* velocity = cuConstRendererParams.velocity; 
-    float* position = cuConstRendererParams.position; 
+    if (index >= cuConstRendererParams.numberOfCircles)
+        return;
+
+    float* velocity = cuConstRendererParams.velocity;
+    float* position = cuConstRendererParams.position;
 
     int index3 = 3 * index;
     // reverse velocity if center position < 0
     float oldVelocity = velocity[index3+1];
     float oldPosition = position[index3+1];
 
-    if (oldVelocity == 0.f && oldPosition == 0.f) { // stop-condition 
+    if (oldVelocity == 0.f && oldPosition == 0.f) { // stop-condition
         return;
     }
 
-    if (position[index3+1] < 0 && oldVelocity < 0.f) { // bounce ball 
+    if (position[index3+1] < 0 && oldVelocity < 0.f) { // bounce ball
         velocity[index3+1] *= kDragCoeff;
     }
 
@@ -233,7 +239,7 @@ __global__ void kernelAdvanceBouncingBalls() {
 
     if (fabsf(velocity[index3+1] - oldVelocity) < epsilon
         && oldPosition < 0.0f
-        && fabsf(position[index3+1]-oldPosition) < epsilon) { // stop ball 
+        && fabsf(position[index3+1]-oldPosition) < epsilon) { // stop ball
         velocity[index3+1] = 0.f;
         position[index3+1] = 0.f;
     }
@@ -433,6 +439,104 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+
+// kernelCircleBlockOverlap -- (CUDA device code)
+//
+// For each circle, update the bitmap of blocks affected by it.
+__global__ void kernelCircleBlockOverlap() {
+    int circleIdx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (circleIdx >= cuConstRendererParams.numberOfCircles)
+        return;
+
+    int circleIdx3 = 3 * circleIdx;
+
+    // Read circle center and radius.
+    float3 circleCenter = *(float3 *)(&cuConstRendererParams.position[circleIdx3]);
+    float radius = cuConstRendererParams.radius[circleIdx];
+
+    // Compute circle bounding box, clamped to edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (circleCenter.x - radius));
+    short maxX = static_cast<short>(imageWidth * (circleCenter.x + radius)) + 1;
+    short minY = static_cast<short>(imageHeight * (circleCenter.y - radius));
+    short maxY = static_cast<short>(imageHeight * (circleCenter.y + radius)) + 1;
+
+    // Clamp to screen.
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+    // Find minimum and maximum block indices that are affected by bounding box.
+    short blockMinX = screenMinX / PIXEL_BLOCK_DIM_X;
+    short blockMaxX = screenMaxX / PIXEL_BLOCK_DIM_X;
+    short blockMinY = screenMinY / PIXEL_BLOCK_DIM_Y;
+    short blockMaxY = screenMaxY / PIXEL_BLOCK_DIM_Y;
+
+    for (int col = blockMinX; col <= blockMaxX; col++) {
+        for (int row = blockMinY; row <= blockMaxY; row++) {
+            int blockNumber = row * PIXEL_BLOCK_DIM_X + col;
+            int numCircles = cuConstRendererParams.numberOfCircles;
+            cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx] = 1;
+        }
+    }
+}
+
+// kernelShadePixels -- (CUDA device code)
+//
+// For each pixel, examine the list of circles that affect its block. Determine which
+// circles affect the pixel, and shade if affected.
+__global__ void kernelShadePixels() {
+    const int numCircles = cuConstRendererParams.numberOfCircles;
+    int blockNumber = blockIdx.x + gridDim.x + blockIdx.y;
+    __shared__ float3 rgbs[numCircles];
+    __shared__ float3 centers[numCircles];
+    __shared__ float radii[numCircles];
+    __shared__ int numActiveCircles;
+
+    int tid = threadIdx.x * blockDim.x + threadIdx.y;
+
+    __syncthreads(); // just in case
+
+    // thread 0 in the block pulls circle rgbs into shared memory
+    if (tid == 0) { // TODO this can and should be optimized
+        numActiveCircles = 0;
+        for (int circleIdx = 0; circleIdx < numCircles; circleIdx++) {
+            char circleAffectsBlock = cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx];
+            if (circleAffectsBlock) {
+                float3 rgb = *(float3*)&(cuConstRendererParams.color[circleIdx*3]);
+                float3 center = *(float3*)(&cuConstRendererParams.position[circleIdx*3]);
+                float radius = cuConstRendererParams.radius[circleIdx];;
+
+                rgbs[numActiveCircles] = rgb;
+                centers[numActiveCircles] = center;
+                radii[numActiveCircles] = radius;
+
+                numActiveCircles++;
+            }
+        }
+    }
+    __syncthreads();
+
+    // Process pixel level changes.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    short pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    float4* imagePtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 existingColor = *imagePtr; // global read!
+
+    // calculate pixel distance from circle center
+    // calculate alpha and rgb
+
+    for (int i = 0; i < numActiveCircles; i++) {
+        // calculations here
+    }
+
+    *imagePtr = existingColor;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -450,6 +554,7 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceColor = NULL;
     cudaDeviceRadius = NULL;
     cudaDeviceImageData = NULL;
+    cudaDeviceBlockCircleOverlap = NULL;
 }
 
 CudaRenderer::~CudaRenderer() {
@@ -530,7 +635,12 @@ CudaRenderer::setup() {
                "NVIDIA RTX 2080.\n");
         printf("---------------------------------------------------------\n");
     }
-    
+
+    // Calculate number of blocks
+    int gridDimX = (image->width + PIXEL_BLOCK_DIM_X - 1) / PIXEL_BLOCK_DIM_X;
+    int gridDimY = (image->height + PIXEL_BLOCK_DIM_Y - 1) / PIXEL_BLOCK_DIM_Y;
+    int numBlocks = gridDimX * gridDimY;
+
     // By this time the scene should be loaded.  Now copy all the key
     // data structures into device memory so they are accessible to
     // CUDA kernels
@@ -543,11 +653,13 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numberOfCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numberOfCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
+    cudaMalloc(&cudaDeviceBlockCircleOverlap, sizeof(char) * numberOfCircles * numBlocks);
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numberOfCircles, cudaMemcpyHostToDevice);
+    cudaMemset(cudaDeviceBlockCircleOverlap, 0, sizeof(char) * numberOfCircles * numBlocks);
 
     // Initialize parameters in constant memory.  We didn't talk about
     // constant memory in class, but the use of read-only constant
@@ -567,6 +679,8 @@ CudaRenderer::setup() {
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
+    params.blockCircleOverlap = cudaDeviceBlockCircleOverlap;
+
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -645,8 +759,8 @@ CudaRenderer::advanceAnimation() {
         kernelAdvanceBouncingBalls<<<gridDim, blockDim>>>();
     } else if (sceneName == HYPNOSIS) {
         kernelAdvanceHypnosis<<<gridDim, blockDim>>>();
-    } else if (sceneName == FIREWORKS) { 
-        kernelAdvanceFireWorks<<<gridDim, blockDim>>>(); 
+    } else if (sceneName == FIREWORKS) {
+        kernelAdvanceFireWorks<<<gridDim, blockDim>>>();
     }
     cudaDeviceSynchronize();
 }
@@ -654,7 +768,7 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
+    dim3 blockDim(CIRCLE_BLOCK_DIM_X, CIRCLE_BLOCK_DIM_Y);
     dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
 
     kernelRenderCircles<<<gridDim, blockDim>>>();

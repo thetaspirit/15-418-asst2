@@ -26,6 +26,9 @@ private:
     float* cudaDeviceColor;
     float* cudaDeviceRadius;
     float* cudaDeviceImageData;
+    char* cudaDeviceBlockCircleOverlap; // Array of bitmaps (one per block), where each bitmap
+                                       // represents which circles affect that block
+
 
 public:
 
@@ -49,7 +52,7 @@ public:
     void shadePixel(
         float pixelCenterX, float pixelCenterY,
         float px, float py, float pz,
-        float* pixelData, 
+        float* pixelData,
         int circleIndex);
 };
 
