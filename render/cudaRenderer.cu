@@ -18,7 +18,7 @@
 #include "util.h"
 
 #define BLOCK_DIM_X 256
-#define BLOCK_DIM_Y 128
+#define BLOCK_DIM_Y 1
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
@@ -441,7 +441,9 @@ __global__ void kernelRenderCircles() {
 //
 // For each circle, update the bitmap of blocks affected by it.
 __global__ void kernelCircleBlockOverlap() {
-    int circleIdx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int circleIdx = ((blockIdx.y * gridDim.x) + blockIdx.x) * (blockDim.x * blockDim.y) + (threadIdx.y * blockDim.x) + threadIdx.x;
+    // think of this as the index of the thread, out of all the other threads that were created on this GPU (in this grid)
 
     // we may have launched more threads than total circles
     // so if thread this thread has no circle, it returns early
@@ -455,6 +457,7 @@ __global__ void kernelCircleBlockOverlap() {
     float radius = cuConstRendererParams.radius[circleIdx];
 
     // Compute circle bounding box, clamped to edges of the screen.
+    // note x and y coords are in pixels
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
     short minX = static_cast<short>(imageWidth * (circleCenter.x - radius));
@@ -471,17 +474,26 @@ __global__ void kernelCircleBlockOverlap() {
     // Find minimum and maximum (pixel) block indices that are affected by bounding box.
     short blockMinX = screenMinX / blockDim.x;
     short blockMaxX = screenMaxX / blockDim.x;
+    blockMaxX = (blockMaxX > gridDim.x) ? gridDim.x : blockMaxX;
     short blockMinY = screenMinY / blockDim.y;
     short blockMaxY = screenMaxY / blockDim.y;
+    blockMaxY = (blockMaxY > gridDim.y) ? gridDim.y : blockMaxY;
 
     // set the byte for each pixel block that overlaps with this circle in the bitmap
     for (int col = blockMinX; col <= blockMaxX; col++) {
         for (int row = blockMinY; row <= blockMaxY; row++) {
-            int blockNumber = row * blockDim.x + col;
+            int blockNumber = row * gridDim.x + col;
             int numCircles = cuConstRendererParams.numberOfCircles;
             cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx] = 1;
         }
     }
+    /*
+    for (int blockNumber = 0; blockNumber < gridDim.x*gridDim.y; blockNumber++) {
+          int numCircles = cuConstRendererParams.numberOfCircles;
+          cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx] = 1;
+    }
+    */
+
 }
 
 // kernelShadePixels -- (CUDA device code)
@@ -497,9 +509,10 @@ __global__ void kernelShadePixels() {
     __shared__ float radius2; // equal to the radius of a circle, squared (bc it's more convenient to have it alr squared later on)
     float alpha;
 
-    int tid = threadIdx.x * blockDim.x + threadIdx.y;
-    short pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-    short pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    int tid = threadIdx.x * blockDim.x + threadIdx.y; // thread number, relative to other threads in this block
+    short pixelX = blockIdx.x * blockDim.x + threadIdx.x; // x-coord of pixel in picture
+    short pixelY = blockIdx.y * blockDim.y + threadIdx.y; // y-coord of pixel in picture
+    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight) return;
     float4* imagePtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)]);
     float4 existingColor = *imagePtr;
 
@@ -510,13 +523,13 @@ __global__ void kernelShadePixels() {
       char circleAffectsBlock = cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circle];
       if (!circleAffectsBlock) continue;
 
-      if (tid == 0) { // for now, only tid0 pulls in the data for the circle
+      // if (tid == 0) { // for now, only tid0 pulls in the data for the circle
                       // TODO this (probably) can and should be optimized
         rgb = *(float3*)&(cuConstRendererParams.color[circle*3]);
         center = *(float3*)(&cuConstRendererParams.position[circle*3]);
         radius = cuConstRendererParams.radius[circle];
         radius2 = radius * radius;
-      }
+      // }
       __syncthreads();
 
       float diffX = pixelX - center.x;
@@ -526,7 +539,7 @@ __global__ void kernelShadePixels() {
 
       // This circle does not contribute to this pixel because this pixel lies outside the circle
       if (pixelDist > radius2)
-        continue;
+         continue;
 
       // Otherwise, apply the circle to this pixel
       // There is a non-zero contribution.  Now compute the shading value
@@ -549,7 +562,7 @@ __global__ void kernelShadePixels() {
         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
       } else {
         // Simple: each circle has an assigned color
-        alpha = .5f;
+        alpha = 0.5f;
       }
 
       // apply calculated/found rgb and alpha to the pixel
@@ -560,6 +573,7 @@ __global__ void kernelShadePixels() {
       newColor.w = alpha + existingColor.w;
       existingColor = newColor;
     }
+    __syncthreads();
 
     *imagePtr = existingColor;
 }
@@ -603,6 +617,7 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
+        cudaFree(cudaDeviceBlockCircleOverlap);
     }
 }
 
@@ -675,8 +690,8 @@ CudaRenderer::setup() {
     // See the CUDA Programmer's Guide for descriptions of
     // cudaMalloc and cudaMemcpy
 
-    int gridDimX = (numberOfCircles + BLOCK_DIM_X - 1) / BLOCK_DIM_X;
-    int gridDimY = (numberOfCircles + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y;
+    int gridDimX = (image->width + BLOCK_DIM_X - 1) / BLOCK_DIM_X;
+    int gridDimY = (image->height + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y;
     int numberOfBlocks = gridDimX * gridDimY;
 
     cudaMalloc(&cudaDevicePosition, sizeof(float) * 3 * numberOfCircles);
@@ -796,14 +811,30 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+#define DEBUG
+#ifdef DEBUG
+#define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+  if (code != cudaSuccess)
+{
+  fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+      cudaGetErrorString(code), file, line);
+  if (abort) exit(code);
+}
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 void
 CudaRenderer::render() {
     // 256 threads per block is a healthy number
     dim3 blockDim(BLOCK_DIM_X, BLOCK_DIM_Y);
-    dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x, (numberOfCircles + blockDim.y - 1) / blockDim.y);
+    dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x, (image->height + blockDim.y - 1) / blockDim.y);
 
     kernelCircleBlockOverlap<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    cudaCheckError(cudaDeviceSynchronize());
     kernelShadePixels<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    cudaCheckError(cudaDeviceSynchronize());
 }
