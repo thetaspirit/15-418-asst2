@@ -20,6 +20,22 @@
 #define BLOCK_DIM_X 2
 #define BLOCK_DIM_Y 128
 
+#define DEBUG
+#ifdef DEBUG
+#define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+  if (code != cudaSuccess)
+{
+  fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+      cudaGetErrorString(code), file, line);
+  if (abort) exit(code);
+}
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -35,7 +51,7 @@ struct GlobalConstants {
   float* velocity;
   float* color;
   float* radius;
-  char* blockCircleOverlap;
+  // char* blockCircleOverlap;
 
   int imageWidth;
   int imageHeight;
@@ -367,7 +383,8 @@ __global__ void kernelCircleBlockOverlap() {
     for (int col = blockMinX; col <= blockMaxX; col++) {
       int blockNumber = row * gridDim.x + col;
       int numCircles = cuConstRendererParams.numberOfCircles;
-      cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx] = 1;
+      // printf("INDEXXING to set bit %d\n", blockNumber * numCircles + circleIdx);
+      // cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx] = 1;
     }
   }
 }
@@ -386,8 +403,8 @@ __global__ void kernelShadePixels() {
   float alpha;
 
   int tid = threadIdx.x * blockDim.x + threadIdx.y; // thread number, relative to other threads in this block
-  short pixelX = blockIdx.x * blockDim.x + threadIdx.x; // x-coord of pixel in picture
-  short pixelY = blockIdx.y * blockDim.y + threadIdx.y; // y-coord of pixel in picture
+  int pixelX = blockIdx.x * blockDim.x + threadIdx.x; // x-coord of pixel in picture
+  int pixelY = blockIdx.y * blockDim.y + threadIdx.y; // y-coord of pixel in picture
   if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight) return;
   float4* imagePtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)]);
   float4 existingColor = *imagePtr;
@@ -396,7 +413,7 @@ __global__ void kernelShadePixels() {
 
   for (int circle = 0; circle < numCircles; circle++) { // iterating through each circle that affects this pixel's block
     __syncthreads();
-    char circleAffectsBlock = cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circle];
+    // TODO bug here: char circleAffectsBlock = cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circle];
     // if (!circleAffectsBlock) continue;
 
     // if (tid == 0) { // for now, only tid0 pulls in the data for the circle
@@ -475,7 +492,7 @@ CudaRenderer::CudaRenderer() {
   cudaDeviceColor = NULL;
   cudaDeviceRadius = NULL;
   cudaDeviceImageData = NULL;
-  cudaDeviceBlockCircleOverlap = NULL;
+  // cudaDeviceBlockCircleOverlap = NULL;
 }
 
 CudaRenderer::~CudaRenderer() {
@@ -497,7 +514,7 @@ CudaRenderer::~CudaRenderer() {
     cudaFree(cudaDeviceColor);
     cudaFree(cudaDeviceRadius);
     cudaFree(cudaDeviceImageData);
-    cudaFree(cudaDeviceBlockCircleOverlap);
+    // cudaCheckError(cudaFree(cudaDeviceBlockCircleOverlap));
   }
 }
 
@@ -579,13 +596,14 @@ cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numberOfCircles);
 cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numberOfCircles);
 cudaMalloc(&cudaDeviceRadius, sizeof(float) * numberOfCircles);
 cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
-cudaMalloc(&cudaDeviceBlockCircleOverlap, sizeof(char) * numberOfCircles * numberOfBlocks);
+// cudaCheckError(cudaMalloc(&cudaDeviceBlockCircleOverlap, sizeof(char) * numberOfCircles * numberOfBlocks));
+// printf("BYTES MALLOC'D FOR TABLE: %d\n", sizeof(char) * numberOfCircles * numberOfBlocks);
 
 cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
 cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
 cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
 cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numberOfCircles, cudaMemcpyHostToDevice);
-cudaMemset(cudaDeviceBlockCircleOverlap, 0, sizeof(char) * numberOfCircles * numberOfBlocks);
+// cudaCheckError(cudaMemset(cudaDeviceBlockCircleOverlap, 0, sizeof(char) * numberOfCircles * numberOfBlocks));
 
 // Initialize parameters in constant memory.  We didn't talk about
 // constant memory in class, but the use of read-only constant
@@ -605,7 +623,7 @@ params.velocity = cudaDeviceVelocity;
 params.color = cudaDeviceColor;
 params.radius = cudaDeviceRadius;
 params.imageData = cudaDeviceImageData;
-params.blockCircleOverlap = cudaDeviceBlockCircleOverlap;
+// params.blockCircleOverlap = cudaDeviceBlockCircleOverlap;
 
 
 cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
@@ -691,30 +709,14 @@ CudaRenderer::advanceAnimation() {
   cudaDeviceSynchronize();
 }
 
-#define DEBUG
-#ifdef DEBUG
-#define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
-inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-  if (code != cudaSuccess)
-{
-  fprintf(stderr, "CUDA Error: %s at %s:%d\n",
-      cudaGetErrorString(code), file, line);
-  if (abort) exit(code);
-}
-}
-#else
-#define cudaCheckError(ans) ans
-#endif
-
 void
 CudaRenderer::render() {
   // 256 threads per block is a healthy number
   dim3 blockDim(BLOCK_DIM_X, BLOCK_DIM_Y);
   dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x, (image->height + blockDim.y - 1) / blockDim.y);
 
-  kernelCircleBlockOverlap<<<gridDim, blockDim>>>();
-  cudaCheckError(cudaDeviceSynchronize());
+  // kernelCircleBlockOverlap<<<gridDim, blockDim>>>();
+  // cudaCheckError(cudaDeviceSynchronize());
   kernelShadePixels<<<gridDim, blockDim>>>();
   cudaCheckError(cudaDeviceSynchronize());
 }
