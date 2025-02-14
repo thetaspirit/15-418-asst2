@@ -17,8 +17,8 @@
 #include "sceneLoader.h"
 #include "util.h"
 
-#define BLOCK_DIM_X 2
-#define BLOCK_DIM_Y 128
+#define BLOCK_DIM_X 8
+#define BLOCK_DIM_Y 8
 
 #define DEBUG
 #ifdef DEBUG
@@ -51,7 +51,7 @@ struct GlobalConstants {
   float* velocity;
   float* color;
   float* radius;
-  // char* blockCircleOverlap;
+  char* blockCircleOverlap;
 
   int imageWidth;
   int imageHeight;
@@ -372,21 +372,29 @@ __global__ void kernelCircleBlockOverlap() {
   float blockMaxY = maxY / blockDim.y;
 
   // clamping bounds so they stay inside the grid
-  blockMinX = (blockMinX > 0) ? ((blockMinX < gridDim.x-1) ? blockMinX : gridDim.x-1) : 0;
-  blockMaxX = (blockMaxX > 0) ? ((blockMaxX < gridDim.x-1) ? blockMaxX : gridDim.x-1) : 0;
-  blockMinY = (blockMinY > 0) ? ((blockMinY < gridDim.y-1) ? blockMinY : gridDim.y-1) : 0;
-  blockMaxY = (blockMaxY > 0) ? ((blockMaxY < gridDim.y-1) ? blockMaxY : gridDim.y-1) : 0;
-
+  blockMinX = (blockMinX > 0) ? ((blockMinX < gridDim.x) ? blockMinX : gridDim.x) : 0;
+  blockMaxX = (blockMaxX > 0) ? ((blockMaxX < gridDim.x) ? blockMaxX : gridDim.x) : 0;
+  blockMinY = (blockMinY > 0) ? ((blockMinY < gridDim.y) ? blockMinY : gridDim.y) : 0;
+  blockMaxY = (blockMaxY > 0) ? ((blockMaxY < gridDim.y) ? blockMaxY : gridDim.y) : 0;
 
   // set the byte for each pixel block that overlaps with this circle in the bitmap
-  for (int row = blockMinY; row <= blockMaxY; row++) {
-    for (int col = blockMinX; col <= blockMaxX; col++) {
+  for (int row = blockMinY; row < blockMaxY; row++) {
+    for (int col = blockMinX; col < blockMaxX; col++) {
       int blockNumber = row * gridDim.x + col;
       int numCircles = cuConstRendererParams.numberOfCircles;
       // printf("INDEXXING to set bit %d\n", blockNumber * numCircles + circleIdx);
-      // cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx] = 1;
+      // printf("circle %d setting bit for block %d\n", circleIdx, blockNumber);
+      cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx] = 1;
     }
   }
+
+  //for (int i = 0; i < (gridDim.x * gridDim.y) * cuConstRendererParams.numberOfCircles; i+=1) {
+    // if (cuConstRendererParams.blockCircleOverlap[i]) {
+    //    printf("bit %d is set to 1\n", i);
+    // }
+    // cuConstRendererParams.blockCircleOverlap[i] = 1;
+
+  //}
 }
 
 // kernelShadePixels -- (CUDA device code)
@@ -394,8 +402,9 @@ __global__ void kernelCircleBlockOverlap() {
 // For each pixel, examine the list of circles that affect its block. Determine which
 // circles affect the pixel, and shade if affected.
 __global__ void kernelShadePixels() {
+
   const int numCircles = cuConstRendererParams.numberOfCircles;
-  int blockNumber = blockIdx.x + gridDim.x + blockIdx.y; // imagine we flattened the grid
+  int blockNumber = blockIdx.y * gridDim.x + blockIdx.x; // imagine we flattened the grid
   __shared__ float3 rgb;
   __shared__ float3 center;
   __shared__ float radius;
@@ -413,18 +422,22 @@ __global__ void kernelShadePixels() {
 
   for (int circle = 0; circle < numCircles; circle++) { // iterating through each circle that affects this pixel's block
     __syncthreads();
-    // TODO bug here: char circleAffectsBlock = cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circle];
-    // if (!circleAffectsBlock) continue;
+    char circleAffectsBlock = cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circle];
 
-    // if (tid == 0) { // for now, only tid0 pulls in the data for the circle
+    if (!circleAffectsBlock) {
+        continue;
+    }
+
+    if (tid == 0) { // for now, only tid0 pulls in the data for the circle
     // TODO this (probably) can and should be optimized
-    rgb = *(float3*)&(cuConstRendererParams.color[circle*3]);
-    center = *(float3*)(&cuConstRendererParams.position[circle*3]);
-    radius = cuConstRendererParams.radius[circle];
-    radius2 = radius * radius;
-    // }
+        rgb = *(float3*)&(cuConstRendererParams.color[circle*3]);
+        center = *(float3*)(&cuConstRendererParams.position[circle*3]);
+        radius = cuConstRendererParams.radius[circle];
+        radius2 = radius * radius;
+    }
     __syncthreads();
 
+    // Calculate pixel width
     float invWidth = 1.f / cuConstRendererParams.imageWidth;
     float invHeight = 1.f / cuConstRendererParams.imageHeight;
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
@@ -445,7 +458,7 @@ __global__ void kernelShadePixels() {
       // will evaluate the same for all threads, there is overhead in
       // setting up the lane masks, etc., to implement the conditional.  It
       // would be wise to perform this logic outside of the loops in
-      // kernelRenderCircles.  
+      // kernelRenderCircles.
       // (If feeling good about yourself, you could use some specialized template magic).
 
       const float kCircleMaxAlpha = .5f;
@@ -455,7 +468,7 @@ __global__ void kernelShadePixels() {
       rgb = lookupColor(normPixelDist);
 
       float maxAlpha = .6f + .4f * (1.f-center.z);
-      maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); 
+      maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
       alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
     } else {
       // Simple: each circle has an assigned color
@@ -492,7 +505,7 @@ CudaRenderer::CudaRenderer() {
   cudaDeviceColor = NULL;
   cudaDeviceRadius = NULL;
   cudaDeviceImageData = NULL;
-  // cudaDeviceBlockCircleOverlap = NULL;
+  cudaDeviceBlockCircleOverlap = NULL;
 }
 
 CudaRenderer::~CudaRenderer() {
@@ -514,7 +527,7 @@ CudaRenderer::~CudaRenderer() {
     cudaFree(cudaDeviceColor);
     cudaFree(cudaDeviceRadius);
     cudaFree(cudaDeviceImageData);
-    // cudaCheckError(cudaFree(cudaDeviceBlockCircleOverlap));
+    cudaCheckError(cudaFree(cudaDeviceBlockCircleOverlap));
   }
 }
 
@@ -596,14 +609,14 @@ cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numberOfCircles);
 cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numberOfCircles);
 cudaMalloc(&cudaDeviceRadius, sizeof(float) * numberOfCircles);
 cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
-// cudaCheckError(cudaMalloc(&cudaDeviceBlockCircleOverlap, sizeof(char) * numberOfCircles * numberOfBlocks));
+cudaCheckError(cudaMalloc(&cudaDeviceBlockCircleOverlap, sizeof(char) * numberOfCircles * numberOfBlocks));
 // printf("BYTES MALLOC'D FOR TABLE: %d\n", sizeof(char) * numberOfCircles * numberOfBlocks);
 
 cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
 cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
 cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
 cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numberOfCircles, cudaMemcpyHostToDevice);
-// cudaCheckError(cudaMemset(cudaDeviceBlockCircleOverlap, 0, sizeof(char) * numberOfCircles * numberOfBlocks));
+cudaCheckError(cudaMemset(cudaDeviceBlockCircleOverlap, 0, sizeof(char) * numberOfCircles * numberOfBlocks));
 
 // Initialize parameters in constant memory.  We didn't talk about
 // constant memory in class, but the use of read-only constant
@@ -623,7 +636,7 @@ params.velocity = cudaDeviceVelocity;
 params.color = cudaDeviceColor;
 params.radius = cudaDeviceRadius;
 params.imageData = cudaDeviceImageData;
-// params.blockCircleOverlap = cudaDeviceBlockCircleOverlap;
+params.blockCircleOverlap = cudaDeviceBlockCircleOverlap;
 
 
 cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
@@ -711,12 +724,15 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-  // 256 threads per block is a healthy number
   dim3 blockDim(BLOCK_DIM_X, BLOCK_DIM_Y);
   dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x, (image->height + blockDim.y - 1) / blockDim.y);
 
-  // kernelCircleBlockOverlap<<<gridDim, blockDim>>>();
-  // cudaCheckError(cudaDeviceSynchronize());
+  printf("imageWidth=%d, imageHeight=%d\n", image->width, image->height);
+  printf("blockDim.x=%d, blockDim.y=%d, gridDim.x=%d, gridDim.y=%d\n", blockDim.x, blockDim.y, gridDim.x, gridDim.y);
+
+  kernelCircleBlockOverlap<<<gridDim, blockDim>>>();
+  cudaCheckError(cudaDeviceSynchronize());
+
   kernelShadePixels<<<gridDim, blockDim>>>();
   cudaCheckError(cudaDeviceSynchronize());
 }
