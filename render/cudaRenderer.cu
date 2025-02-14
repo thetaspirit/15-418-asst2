@@ -17,8 +17,8 @@
 #include "sceneLoader.h"
 #include "util.h"
 
-#define BLOCK_DIM_X 1
-#define BLOCK_DIM_Y 256
+#define BLOCK_DIM_X 2
+#define BLOCK_DIM_Y 128
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
@@ -321,122 +321,6 @@ __global__ void kernelAdvanceSnowflake() {
 *((float3*)velocityPtr) = velocity;
 }
 
-// shadePixel -- (CUDA device code)
-//
-// Given a pixel and a circle, determine the contribution to the
-// pixel from the circle.  Update of the image is done in this
-// function.  Called by kernelRenderCircles()
-__device__ __inline__ void
-shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
-
-  float diffX = p.x - pixelCenter.x;
-  float diffY = p.y - pixelCenter.y;
-  float pixelDist = diffX * diffX + diffY * diffY;
-
-  float rad = cuConstRendererParams.radius[circleIndex];;
-  float maxDist = rad * rad;
-
-  // Circle does not contribute to the image
-  if (pixelDist > maxDist)
-    return;
-
-  float3 rgb;
-  float alpha;
-
-  // There is a non-zero contribution.  Now compute the shading value
-
-  // Suggestion: This conditional is in the inner loop.  Although it
-  // will evaluate the same for all threads, there is overhead in
-  // setting up the lane masks, etc., to implement the conditional.  It
-  // would be wise to perform this logic outside of the loops in
-  // kernelRenderCircles.  (If feeling good about yourself, you
-  // could use some specialized template magic).
-  if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-
-    const float kCircleMaxAlpha = .5f;
-    const float falloffScale = 4.f;
-
-    float normPixelDist = sqrt(pixelDist) / rad;
-    rgb = lookupColor(normPixelDist);
-
-    float maxAlpha = .6f + .4f * (1.f-p.z);
-    maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
-    alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-
-  } else {
-    // Simple: each circle has an assigned color
-    int index3 = 3 * circleIndex;
-    rgb = *(float3*)&(cuConstRendererParams.color[index3]);
-    alpha = .5f;
-  }
-
-  float oneMinusAlpha = 1.f - alpha;
-
-  // BEGIN SHOULD-BE-ATOMIC REGION
-  // global memory read
-
-  float4 existingColor = *imagePtr;
-  float4 newColor;
-  newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-  newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-  newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-  newColor.w = alpha + existingColor.w;
-
-  // Global memory write
-  *imagePtr = newColor;
-
-  // END SHOULD-BE-ATOMIC REGION
-}
-
-// kernelRenderCircles -- (CUDA device code)
-//
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
-__global__ void kernelRenderCircles() {
-
-  int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (index >= cuConstRendererParams.numberOfCircles)
-    return;
-
-  int index3 = 3 * index;
-
-  // Read position and radius
-  float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-  float  rad = cuConstRendererParams.radius[index];
-
-  // Compute the bounding box of the circle. The bound is in integer
-  // screen coordinates, so it's clamped to the edges of the screen.
-  short imageWidth = cuConstRendererParams.imageWidth;
-  short imageHeight = cuConstRendererParams.imageHeight;
-  short minX = static_cast<short>(imageWidth * (p.x - rad));
-  short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-  short minY = static_cast<short>(imageHeight * (p.y - rad));
-  short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-  // A bunch of clamps.  Is there a CUDA built-in for this?
-  short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-  short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-  short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-  short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-  float invWidth = 1.f / imageWidth;
-  float invHeight = 1.f / imageHeight;
-
-  // For all pixels in the bounding box
-  for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-    for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-      float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-          invHeight * (static_cast<float>(pixelY) + 0.5f));
-      shadePixel(pixelCenterNorm, p, imgPtr, index);
-      imgPtr++;
-    }
-  }
-}
-
-
 // kernelCircleBlockOverlap -- (CUDA device code)
 //
 // For each circle, update the bitmap of blocks affected by it.
@@ -458,40 +342,34 @@ __global__ void kernelCircleBlockOverlap() {
 
   // Compute circle bounding box, clamped to edges of the screen.
   // note x and y coords are in pixels
-  short imageWidth = cuConstRendererParams.imageWidth;
-  short imageHeight = cuConstRendererParams.imageHeight;
-  short minX = static_cast<short>(imageWidth * (circleCenter.x - radius));
-  short maxX = static_cast<short>(imageWidth * (circleCenter.x + radius)) + 1;
-  short minY = static_cast<short>(imageHeight * (circleCenter.y - radius));
-  short maxY = static_cast<short>(imageHeight * (circleCenter.y + radius)) + 1;
+  float imageWidth = cuConstRendererParams.imageWidth;
+  float imageHeight = cuConstRendererParams.imageHeight;
+  float minX = (imageWidth * (circleCenter.x - radius));
+  float maxX = (imageWidth * (circleCenter.x + radius)) + 1;
+  float minY = (imageHeight * (circleCenter.y - radius));
+  float maxY = (imageHeight * (circleCenter.y + radius)) + 1;
 
-  // Clamp to screen. TODO find cuda function for this
-  short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-  short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-  short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-  short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+  // converting pixel-coords of bounding box into block-coords of bounding box
+  float blockMinX = minX / blockDim.x;
+  float blockMaxX = maxX / blockDim.x;
+  float blockMinY = minY / blockDim.y;
+  float blockMaxY = maxY / blockDim.y;
 
-  // Find minimum and maximum (pixel) block indices that are affected by bounding box.
-  short blockMinX = screenMinX / blockDim.x;
-  short blockMaxX = screenMaxX / blockDim.x;
-  blockMaxX = (blockMaxX > gridDim.x) ? gridDim.x : blockMaxX;
-  short blockMinY = screenMinY / blockDim.y;
-  short blockMaxY = screenMaxY / blockDim.y;
-  blockMaxY = (blockMaxY > gridDim.y) ? gridDim.y : blockMaxY;
+  // clamping bounds so they stay inside the grid
+  blockMinX = (blockMinX > 0) ? ((blockMinX < gridDim.x-1) ? blockMinX : gridDim.x-1) : 0;
+  blockMaxX = (blockMaxX > 0) ? ((blockMaxX < gridDim.x-1) ? blockMaxX : gridDim.x-1) : 0;
+  blockMinY = (blockMinY > 0) ? ((blockMinY < gridDim.y-1) ? blockMinY : gridDim.y-1) : 0;
+  blockMaxY = (blockMaxY > 0) ? ((blockMaxY < gridDim.y-1) ? blockMaxY : gridDim.y-1) : 0;
+
 
   // set the byte for each pixel block that overlaps with this circle in the bitmap
-  for (int col = blockMinX; col <= blockMaxX; col++) {
-    for (int row = blockMinY; row <= blockMaxY; row++) {
+  for (int row = blockMinY; row <= blockMaxY; row++) {
+    for (int col = blockMinX; col <= blockMaxX; col++) {
       int blockNumber = row * gridDim.x + col;
       int numCircles = cuConstRendererParams.numberOfCircles;
       cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx] = 1;
     }
   }
-     for (int blockNumber = 0; blockNumber < gridDim.x*gridDim.y; blockNumber++) {
-     int numCircles = cuConstRendererParams.numberOfCircles;
-     cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx] = 1;
-     }
-
 }
 
 // kernelShadePixels -- (CUDA device code)
@@ -519,7 +397,7 @@ __global__ void kernelShadePixels() {
   for (int circle = 0; circle < numCircles; circle++) { // iterating through each circle that affects this pixel's block
     __syncthreads();
     char circleAffectsBlock = cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circle];
-    if (!circleAffectsBlock) continue;
+    // if (!circleAffectsBlock) continue;
 
     // if (tid == 0) { // for now, only tid0 pulls in the data for the circle
     // TODO this (probably) can and should be optimized
