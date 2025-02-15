@@ -29,6 +29,33 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void
+upsweep_kernel(int N, int *data, int twod, int twod1) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = tid * twod1;
+
+    if (i < N) {
+        data[i+twod1-1] += data[i+twod-1];
+    }
+}
+
+__global__ void
+downsweep_kernel(int N, int *data, int twod, int twod1) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = tid * twod1;
+
+    if (i < N) {
+        int t = data[i+twod-1];
+        data[i+twod-1] = data[i+twod1-1];
+        data[i+twod1-1] += t;
+    }
+}
+
+__global__ void
+device_array_set(int* data, int i, int val) {
+    data[i] = val;
+}
+
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -43,6 +70,27 @@ void exclusive_scan(int* device_data, int length)
      * both the data array is sized to accommodate the next
      * power of 2 larger than the input.
      */
+    int N = nextPow2(length);
+
+    for (int twod = 1; twod < N; twod*=2) {
+        int twod1 = twod*2;
+        int numThreads = N / twod1;
+        int threadsPerBlock = 512;
+        int numBlocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+        upsweep_kernel<<<numBlocks, threadsPerBlock>>>(N, device_data, twod, twod1);
+    }
+
+    device_array_set<<<1, 1>>>(device_data, N-1, 0);
+
+    for (int twod = N/2; twod >= 1; twod /= 2) {
+        int twod1 = twod*2;
+        int numThreads = N / twod1;
+        int threadsPerBlock = 512;
+        int numBlocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+        downsweep_kernel<<<numBlocks, threadsPerBlock>>>(N, device_data, twod, twod1);
+    }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -108,7 +156,31 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration;
 }
 
+// Writes a 1 to result[i] if data[i] is a peak.
+__global__ void
+flagpeaks_kernel(int N, int *data, int *result) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
 
+    if (0 < i && i < N-1) {
+        if (data[i-1] < data[i] && data[i] > data[i+1])
+            result[i] = 1;
+    }
+}
+
+__global__ void
+writepeaks_kernel(int N, int *peaks_flags, int *output, int *num_peaks) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (1 < i && i < N) {
+        if (peaks_flags[i] > peaks_flags[i-1]) {
+           int peak_number = peaks_flags[i];
+           int peak_location = i - 1;
+           output[peak_number - 1] = peak_location;
+           // atomicMax(num_peaks, peak_number);
+           atomicAdd(num_peaks, 1);
+        }
+    }
+}
 
 int find_peaks(int *device_input, int length, int *device_output) {
     /* TODO:
@@ -125,7 +197,35 @@ int find_peaks(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
-    return 0;
+    if (length < 3)
+        return 0;
+
+    int numThreads = length;
+    int threadsPerBlock = 128;
+    int numBlocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+    int *device_scratch;
+    cudaMalloc((void **) &device_scratch, sizeof(int)*nextPow2(length));
+    cudaMemset(device_scratch, 0, sizeof(int)*nextPow2(length));
+
+    flagpeaks_kernel<<<numBlocks, threadsPerBlock>>>(length, device_input,
+        device_scratch);
+
+    exclusive_scan(device_scratch, length);
+
+    int *device_num_peaks;
+    cudaMalloc((void **) &device_num_peaks, sizeof(int));
+    cudaMemset(device_num_peaks, 0, sizeof(int));
+
+    writepeaks_kernel<<<numBlocks, threadsPerBlock>>>(length, device_scratch,
+        device_output, device_num_peaks);
+
+    cudaDeviceSynchronize();
+
+    int *num_peaks = (int *) malloc(sizeof(int)); // zero to start
+    cudaMemcpy(num_peaks, device_num_peaks, sizeof(int), cudaMemcpyDeviceToHost);
+
+    return *num_peaks;
 }
 
 
