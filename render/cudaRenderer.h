@@ -27,7 +27,9 @@ private:
     float* cudaDeviceRadius;
     float* cudaDeviceImageData;
     char* cudaDeviceBlockCircleOverlap; // Array of bitmaps (one per block), where each bitmap
-                                       // represents which circles affect that block
+                                        // represents which circles affect that block
+    int* cudaDeviceCircleQueues;        // Array of queues of circles to be applied
+                                        // to each block
 
 
 public:
