@@ -17,12 +17,11 @@
 #include "sceneLoader.h"
 #include "util.h"
 
-#define BLOCK_DIM_X 16
+#define BLOCK_DIM_X 32
 #define BLOCK_DIM_Y 32
 
 // needs to be a power of 2
 #define CIRCLE_BATCH_SIZE 512
-
 #define DEBUG
 #ifdef DEBUG
 #define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
