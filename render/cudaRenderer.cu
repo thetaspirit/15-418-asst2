@@ -22,6 +22,8 @@
 
 // needs to be a power of 2
 #define CIRCLE_BATCH_SIZE 512
+#define SKIP_CIRCLE -1
+
 #define DEBUG
 #ifdef DEBUG
 #define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
@@ -343,6 +345,19 @@ __global__ void kernelAdvanceSnowflake() {
     *((float3*)velocityPtr) = velocity;
 }
 
+__device__ char pixelInCircle(int pixelX, int pixelY, float3 circleCenter, float radius2, float invWidth, float invHeight) {
+    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight) return 0;
+
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+            invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float diffX = pixelCenterNorm.x - circleCenter.x;
+    float diffY = pixelCenterNorm.y - circleCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    if (pixelDist <= radius2) return 1;
+    else return 0;
+}
+
 // kernelCircleBlockOverlap -- (CUDA device code)
 //
 // For each circle, update the bitmap of blocks affected by it.
@@ -383,13 +398,12 @@ __global__ void kernelCircleBlockOverlap() {
     blockMinY = (blockMinY > 0) ? ((blockMinY < gridDim.y) ? blockMinY : gridDim.y) : 0;
     blockMaxY = (blockMaxY > 0) ? ((blockMaxY < gridDim.y) ? blockMaxY : gridDim.y) : 0;
 
+    // go through each block that might be affected
     // set the byte for each pixel block that overlaps with this circle in the bitmap
     for (int row = blockMinY; row < blockMaxY; row++) {
         for (int col = blockMinX; col < blockMaxX; col++) {
             int blockNumber = row * gridDim.x + col;
             int numCircles = cuConstRendererParams.numberOfCircles;
-            // printf("INDEXXING to set bit %d\n", blockNumber * numCircles + circleIdx);
-            // printf("circle %d setting bit for block %d\n", circleIdx, blockNumber);
             cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIdx] = 1;
         }
     }
@@ -463,6 +477,59 @@ __global__ void kernelFillCircleQueue() {
     atomicExch(queueStart, queueLength);
 }
 
+// kernelCheckBorders -- (CUDA device code)
+//
+// For each block that might be affected by a circle, check borders to make sure.
+__global__ void kernelCheckBorders(float invWidth, float invHeight) {
+    // check if pixel corresponding to this thread is a border
+    if (!(threadIdx.x == 0 || threadIdx.x == BLOCK_DIM_X - 1 || threadIdx.y == 0 || threadIdx.y == BLOCK_DIM_Y - 1)) {
+        return;
+    }
+
+    __shared__ int skipCircle;
+    __shared__ float3 center;
+    __shared__ float radius2;
+
+    int pixelX = blockIdx.x * BLOCK_DIM_X + threadIdx.x;
+    int pixelY = blockIdx.y * BLOCK_DIM_Y + threadIdx.y;
+
+    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight) return;
+
+    if (pixelX == 0 && pixelY == 0) skipCircle = 1; // starts true, if any intersect set to false
+    __syncthreads();
+
+    int blockNumber = blockIdx.y * gridDim.x + gridDim.x;
+    int *queueStart = cuConstRendererParams.circleQueues
+        + blockNumber * (1 + cuConstRendererParams.numberOfCircles);
+    int queueLength = *queueStart;
+    for (int queueOffset = 0; queueOffset < queueLength; queueOffset++) {
+        int circle = queueStart[1 + queueOffset];
+        if (pixelX == 0 && pixelY == 0) {
+            center = *(float3*)(&cuConstRendererParams.position[circle*3]);
+            float radius = cuConstRendererParams.radius[circle];
+            radius2 = radius * radius;
+        }
+        __syncthreads();
+
+        char intersects = pixelInCircle(pixelX, pixelY, center, radius2, invWidth, invHeight);
+        if (intersects) {
+            atomicExch(&skipCircle, 0);
+        }
+        __syncthreads();
+
+        if (pixelX == 0 && pixelY == 0) {
+            if (skipCircle) {
+                queueStart[1 + queueOffset] = SKIP_CIRCLE;
+                skipCircle = 1;
+            }
+        }
+        __syncthreads();
+    }
+
+}
+
+
+
 // kernelShadePixels -- (CUDA device code)
 //
 // For each pixel, examine the list of circles that affect its block. Determine which
@@ -491,6 +558,7 @@ __global__ void kernelShadePixels(float invWidth, float invHeight) {
     for (int queueOffset = 0; queueOffset < queueLength; queueOffset++) {
         __syncthreads();
         int circle = queueStart[1 + queueOffset];
+        if (circle == SKIP_CIRCLE) continue;
 
         // logic here
         if (tid == 0) { // for now, only tid0 pulls in the data for the circle
@@ -812,10 +880,16 @@ CudaRenderer::render() {
     kernelFillCircleQueue<<<gridDim1, blockDim1>>>();
     cudaDeviceSynchronize();
 
-    dim3 blockDim2(BLOCK_DIM_X, BLOCK_DIM_Y);
-    dim3 gridDim2(imageGridDimX, imageGridDimY);
     float invWidth = 1.f / image->width;
     float invHeight = 1.f / image->height;
-    kernelShadePixels<<<gridDim2, blockDim2>>>(invWidth, invHeight);
+
+    // dim3 gridDim2(BLOCK_DIM_X, BLOCK_DIM_Y);
+    // dim3 blockDim2(imageGridDimX, imageGridDimY);
+    // kernelCheckBorders<<<gridDim2, blockDim2>>>(invWidth, invHeight);
+    // cudaDeviceSynchronize();
+
+    dim3 blockDim3(BLOCK_DIM_X, BLOCK_DIM_Y);
+    dim3 gridDim3(imageGridDimX, imageGridDimY);
+    kernelShadePixels<<<gridDim3, blockDim3>>>(invWidth, invHeight);
     cudaDeviceSynchronize();
 }
