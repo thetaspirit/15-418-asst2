@@ -410,54 +410,64 @@ __global__ void kernelFillCircleQueue() {
     __shared__ uint batchInput[CIRCLE_BATCH_SIZE];
     __shared__ uint batchScratch[CIRCLE_BATCH_SIZE];
     __shared__ uint batchOutput[CIRCLE_BATCH_SIZE];
+    __shared__ int queueLength;
 
-    int batchNumber = (blockIdx.y * gridDim.x) + blockIdx.x;
+    int blockNumber = (blockIdx.y * gridDim.x) + blockIdx.x;
     int batchesPerBlock = (cuConstRendererParams.numberOfCircles + CIRCLE_BATCH_SIZE - 1) / CIRCLE_BATCH_SIZE;
-    int blockNumber = batchNumber / batchesPerBlock; // image block
-    int batchIndex = batchNumber % batchesPerBlock;
     int threadIndex = (threadIdx.y * blockDim.x) + threadIdx.x;
-    int circleIndex = batchIndex * CIRCLE_BATCH_SIZE + threadIndex;
 
     // zero out shared memory
-    batchInput[threadIndex] = 0;
-    batchScratch[threadIndex] = 0;
-    batchOutput[threadIndex] = 0;
+    if (threadIndex == 0) queueLength = 0;
     __syncthreads();
 
     int numCircles = cuConstRendererParams.numberOfCircles;
-    if (circleIndex >= numCircles) return;
+    int *queueStart = cuConstRendererParams.circleQueues + blockNumber * (1 + numCircles);
+    for (int batchIndex = 0; batchIndex < batchesPerBlock; batchIndex++) {
+        batchInput[threadIndex] = 0;
+        batchScratch[threadIndex] = 0;
+        batchOutput[threadIndex] = 0;
+        __syncthreads();
 
-    char circleAffectsBlock
-        = cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIndex];
-    batchInput[threadIndex] = static_cast<uint>(circleAffectsBlock); // global --> shared
-    __syncthreads();
+        int circleIndex = batchIndex * CIRCLE_BATCH_SIZE + threadIndex;
 
-    sharedMemExclusiveScan(threadIndex, batchInput, batchOutput, batchScratch, CIRCLE_BATCH_SIZE);
-    __syncthreads();
+        if (circleIndex >= numCircles) return;
 
-    int *queueStart = cuConstRendererParams.circleQueues + (1 + CIRCLE_BATCH_SIZE) * batchNumber;
-    if (threadIndex > 0 && batchOutput[threadIndex] > batchOutput[threadIndex-1]) {
-        int queueIndex = static_cast<int>(batchOutput[threadIndex] - 1);
-        queueStart[1 + queueIndex] = circleIndex - 1; // write to global memory
-        atomicAdd(queueStart, 1); // inc queue length
+        char circleAffectsBlock
+            = cuConstRendererParams.blockCircleOverlap[blockNumber * numCircles + circleIndex];
+        batchInput[threadIndex] = static_cast<uint>(circleAffectsBlock); // global --> shared
+        __syncthreads();
+
+        sharedMemExclusiveScan(threadIndex, batchInput, batchOutput, batchScratch, CIRCLE_BATCH_SIZE);
+        __syncthreads();
+
+        int inc = 0;
+        if (threadIndex > 0 && batchOutput[threadIndex] > batchOutput[threadIndex-1]) {
+            int queueIndex = queueLength + static_cast<int>(batchOutput[threadIndex] - 1);
+            queueStart[1 + queueIndex] = circleIndex - 1; // write to global memory
+            inc += 1;
+        }
+
+        // explicitly check last in batch of circles
+        if ((threadIndex == CIRCLE_BATCH_SIZE - 1 || circleIndex == numCircles - 1)
+            && circleAffectsBlock) {
+            int queueIndex = queueLength + static_cast<int>(batchOutput[threadIndex] - 1 + 1);
+            queueStart[1 + queueIndex] = circleIndex; // write to global memory
+            inc += 1;
+        }
+        __syncthreads();
+
+        atomicAdd(&queueLength, inc);
+        __syncthreads();
     }
-    __syncthreads();
 
-    // explicitly check last in batch of circles
-    if ((threadIndex == CIRCLE_BATCH_SIZE - 1 || circleIndex == numCircles - 1)
-        && circleAffectsBlock) {
-        int queueIndex = static_cast<int>(batchOutput[threadIndex] - 1 + 1);
-        queueStart[1 + queueIndex] = circleIndex; // write to global memory
-        atomicAdd(queueStart, 1); // inc queue length
-    }
-    __syncthreads();
+    atomicExch(queueStart, queueLength);
 }
 
 // kernelShadePixels -- (CUDA device code)
 //
 // For each pixel, examine the list of circles that affect its block. Determine which
 // circles affect the pixel, and shade if affected.
-__global__ void kernelShadePixels() {
+__global__ void kernelShadePixels(float invWidth, float invHeight) {
 
     int blockNumber = blockIdx.y * gridDim.x + blockIdx.x; // imagine we flattened the grid
     __shared__ float3 rgb;
@@ -475,71 +485,66 @@ __global__ void kernelShadePixels() {
 
     __syncthreads(); // just in case
 
-    int numQueues = (cuConstRendererParams.numberOfCircles + CIRCLE_BATCH_SIZE - 1) / CIRCLE_BATCH_SIZE;
-    for (int queueNumber = 0; queueNumber < numQueues; queueNumber++) {
-        int *queueStart = cuConstRendererParams.circleQueues
-            + (blockNumber * numQueues + queueNumber) * (CIRCLE_BATCH_SIZE + 1);
-        int queueLength = *queueStart;
-        for (int queueOffset = 0; queueOffset < queueLength; queueOffset++) {
-            __syncthreads();
-            int circle = queueStart[1 + queueOffset];
+    int *queueStart = cuConstRendererParams.circleQueues
+        + blockNumber * (1 + cuConstRendererParams.numberOfCircles);
+    int queueLength = *queueStart;
+    for (int queueOffset = 0; queueOffset < queueLength; queueOffset++) {
+        __syncthreads();
+        int circle = queueStart[1 + queueOffset];
 
-            // logic here
-            if (tid == 0) { // for now, only tid0 pulls in the data for the circle
-                            // TODO this (probably) can and should be optimized
-                rgb = *(float3*)&(cuConstRendererParams.color[circle*3]);
-                center = *(float3*)(&cuConstRendererParams.position[circle*3]);
-                radius = cuConstRendererParams.radius[circle];
-                radius2 = radius * radius;
-            }
-            __syncthreads();
-
-            // Calculate pixel width
-            float invWidth = 1.f / cuConstRendererParams.imageWidth;
-            float invHeight = 1.f / cuConstRendererParams.imageHeight;
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                    invHeight * (static_cast<float>(pixelY) + 0.5f));
-            float diffX = pixelCenterNorm.x - center.x;
-            float diffY = pixelCenterNorm.y - center.y;
-            float pixelDist = diffX * diffX + diffY * diffY;
-
-
-            // This circle does not contribute to this pixel because this pixel lies outside the circle
-            if (pixelDist > radius2)
-                continue;
-
-            // Otherwise, apply the circle to this pixel
-            // There is a non-zero contribution.  Now compute the shading value
-            if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-                // Suggestion: This conditional is in the inner loop.  Although it
-                // will evaluate the same for all threads, there is overhead in
-                // setting up the lane masks, etc., to implement the conditional.  It
-                // would be wise to perform this logic outside of the loops in
-                // kernelRenderCircles.
-                // (If feeling good about yourself, you could use some specialized template magic).
-
-                const float kCircleMaxAlpha = .5f;
-                const float falloffScale = 4.f;
-
-                float normPixelDist = sqrt(pixelDist) / radius;
-                rgb = lookupColor(normPixelDist);
-
-                float maxAlpha = .6f + .4f * (1.f-center.z);
-                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-                alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-            } else {
-                // Simple: each circle has an assigned color
-                alpha = 0.5f;
-            }
-
-            // apply calculated/found rgb and alpha to the pixel
-            float4 newColor;
-            newColor.x = alpha * rgb.x + (1.f-alpha) * existingColor.x;
-            newColor.y = alpha * rgb.y + (1.f-alpha) * existingColor.y;
-            newColor.z = alpha * rgb.z + (1.f-alpha) * existingColor.z;
-            newColor.w = alpha + existingColor.w;
-            existingColor = newColor;
+        // logic here
+        if (tid == 0) { // for now, only tid0 pulls in the data for the circle
+                        // TODO this (probably) can and should be optimized
+            rgb = *(float3*)&(cuConstRendererParams.color[circle*3]);
+            center = *(float3*)(&cuConstRendererParams.position[circle*3]);
+            radius = cuConstRendererParams.radius[circle];
+            radius2 = radius * radius;
         }
+        __syncthreads();
+
+        // Calculate pixel width
+        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                invHeight * (static_cast<float>(pixelY) + 0.5f));
+        float diffX = pixelCenterNorm.x - center.x;
+        float diffY = pixelCenterNorm.y - center.y;
+        float pixelDist = diffX * diffX + diffY * diffY;
+
+
+        // This circle does not contribute to this pixel because this pixel lies outside the circle
+        if (pixelDist > radius2)
+            continue;
+
+        // Otherwise, apply the circle to this pixel
+        // There is a non-zero contribution.  Now compute the shading value
+        if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+            // Suggestion: This conditional is in the inner loop.  Although it
+            // will evaluate the same for all threads, there is overhead in
+            // setting up the lane masks, etc., to implement the conditional.  It
+            // would be wise to perform this logic outside of the loops in
+            // kernelRenderCircles.
+            // (If feeling good about yourself, you could use some specialized template magic).
+
+            const float kCircleMaxAlpha = .5f;
+            const float falloffScale = 4.f;
+
+            float normPixelDist = sqrt(pixelDist) / radius;
+            rgb = lookupColor(normPixelDist);
+
+            float maxAlpha = .6f + .4f * (1.f-center.z);
+            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+        } else {
+            // Simple: each circle has an assigned color
+            alpha = 0.5f;
+        }
+
+        // apply calculated/found rgb and alpha to the pixel
+        float4 newColor;
+        newColor.x = alpha * rgb.x + (1.f-alpha) * existingColor.x;
+        newColor.y = alpha * rgb.y + (1.f-alpha) * existingColor.y;
+        newColor.z = alpha * rgb.z + (1.f-alpha) * existingColor.z;
+        newColor.w = alpha + existingColor.w;
+        existingColor = newColor;
     }
 
     __syncthreads();
@@ -669,15 +674,15 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numberOfCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
     cudaCheckError(cudaMalloc(&cudaDeviceBlockCircleOverlap, sizeof(char) * numberOfCircles * numberOfBlocks));
-    int batchesPerBlock = (numberOfCircles + CIRCLE_BATCH_SIZE - 1) / CIRCLE_BATCH_SIZE;
-    cudaCheckError(cudaMalloc(&cudaDeviceCircleQueues, sizeof(int) * batchesPerBlock * numberOfBlocks * (CIRCLE_BATCH_SIZE + 1)));
+    // int batchesPerBlock = (numberOfCircles + CIRCLE_BATCH_SIZE - 1) / CIRCLE_BATCH_SIZE;
+    cudaCheckError(cudaMalloc(&cudaDeviceCircleQueues, sizeof(int) * numberOfBlocks * (1 + numberOfCircles)));
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numberOfCircles, cudaMemcpyHostToDevice);
     cudaCheckError(cudaMemset(cudaDeviceBlockCircleOverlap, 0, sizeof(char) * numberOfCircles * numberOfBlocks));
-    cudaCheckError(cudaMemset(cudaDeviceCircleQueues, 0, sizeof(int) * batchesPerBlock * numberOfBlocks * (CIRCLE_BATCH_SIZE + 1)));
+    cudaCheckError(cudaMemset(cudaDeviceCircleQueues, 0, sizeof(int) * numberOfBlocks * (1 + numberOfCircles)));
 
     // Initialize parameters in constant memory.  We didn't talk about
     // constant memory in class, but the use of read-only constant
@@ -791,11 +796,10 @@ CudaRenderer::render() {
     int imageGridDimY = (image->height + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y;
 
     int numBlocks = imageGridDimX * imageGridDimY;
-    int batchesPerBlock = (numberOfCircles + CIRCLE_BATCH_SIZE - 1) / CIRCLE_BATCH_SIZE;
+    // int batchesPerBlock = (numberOfCircles + CIRCLE_BATCH_SIZE - 1) / CIRCLE_BATCH_SIZE;
 
-    cudaMemset(cudaDeviceBlockCircleOverlap, 0, sizeof(char) * numberOfCircles * numBlocks);
-    cudaMemset(cudaDeviceCircleQueues, 0, sizeof(int) * batchesPerBlock * numBlocks * (CIRCLE_BATCH_SIZE + 1));
-
+    cudaCheckError(cudaMemset(cudaDeviceBlockCircleOverlap, 0, sizeof(char) * numberOfCircles * numBlocks));
+    cudaCheckError(cudaMemset(cudaDeviceCircleQueues, 0, sizeof(int) * numBlocks * (1 + numberOfCircles)));
 
     dim3 blockDim0(BLOCK_DIM_X, BLOCK_DIM_Y);
     dim3 gridDim0(imageGridDimX, imageGridDimY);
@@ -804,12 +808,14 @@ CudaRenderer::render() {
 
     // grid dim: batchesPerBlock * blocks
     dim3 blockDim1(CIRCLE_BATCH_SIZE, 1);
-    dim3 gridDim1(batchesPerBlock, numBlocks);
+    dim3 gridDim1(imageGridDimX, imageGridDimY);
     kernelFillCircleQueue<<<gridDim1, blockDim1>>>();
     cudaDeviceSynchronize();
 
     dim3 blockDim2(BLOCK_DIM_X, BLOCK_DIM_Y);
     dim3 gridDim2(imageGridDimX, imageGridDimY);
-    kernelShadePixels<<<gridDim2, blockDim2>>>();
-    cudaCheckError(cudaDeviceSynchronize());
+    float invWidth = 1.f / image->width;
+    float invHeight = 1.f / image->height;
+    kernelShadePixels<<<gridDim2, blockDim2>>>(invWidth, invHeight);
+    cudaDeviceSynchronize();
 }
