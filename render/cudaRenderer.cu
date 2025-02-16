@@ -20,8 +20,6 @@
 #define BLOCK_DIM_X 32 // needs to be power of 2
 #define BLOCK_DIM_Y 32 // needs to be power of 2
 
-// needs to be a power of 2
-#define CIRCLE_BATCH_SIZE (BLOCK_DIM_X * BLOCK_DIM_Y)
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
@@ -68,7 +66,7 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
 
-#define SCAN_BLOCK_DIM CIRCLE_BATCH_SIZE
+#define SCAN_BLOCK_DIM (BLOCK_DIM_X * BLOCK_DIM_Y)
 #include "exclusiveScan.cu_inl"
 
 
